@@ -1,0 +1,7 @@
+## Interface: 20503
+## Title: TheoSwingTimer
+## Notes: Lightweight combat-only white swing timer for TBC Classic 2.5.3
+## Author: Theogreed + ChatGPT
+## Version: 0.6.0-combatonly
+## SavedVariables: TheoSwingTimerDB
+TheoSwingTimer.lua
