@@ -1,6 +1,11 @@
--- TheoSwingTimer - TBC Classic 2.5.3 combat-only white-bar build
+-- TheoSwingTimer - TBC 2.4.3 / TBC Classic 2.5.3 compatible build
 -- Default behavior: ON, hidden out of combat, visible in combat.
 -- Visual style: dark track, white fill scrolling left -> right, white spark, timer text.
+--
+-- Compatibility note:
+-- 2.5.3-style clients usually use CombatLogGetCurrentEventInfo().
+-- 2.4.3-style clients usually pass combat-log values directly through COMBAT_LOG_EVENT_UNFILTERED.
+-- This file supports both paths.
 
 local TSW = {}
 _G.TheoSwingTimer = TSW
@@ -43,13 +48,15 @@ local defaults = {
     height = 14,
     x = 0,
     y = -120,
-    version = 6,
+    version = 8,
+    showOH = false,
 }
 
 local db
 local eventFrame = CreateFrame("Frame")
 local frame, title, mhBar, ohBar
 local playerGUID
+local playerName
 local inCombat = false
 local testMode = false
 
@@ -68,12 +75,13 @@ local function CopyDefaults()
         if db[k] == nil then db[k] = v end
     end
 
-    -- Migration from earlier test builds:
-    -- preserve position/size, but force the new requested default behavior.
-    if db.version ~= 6 then
+    -- Migration from earlier test/visible builds:
+    -- preserve position/size, but force the requested default behavior.
+    if db.version ~= 8 then
         db.enabled = true
         db.showOOC = false
-        db.version = 6
+        db.showOH = false
+        db.version = 8
     end
 end
 
@@ -363,7 +371,7 @@ local function OnUpdate(self, elapsed)
 
     UpdateBar(mhBar, mhStart, mhDur, now)
 
-    if ohDur then
+    if ohDur and db.showOH then
         ohBar:Show()
         UpdateBar(ohBar, ohStart, ohDur, now)
     else
@@ -425,6 +433,8 @@ local function PrintHelp()
     Chat("commands:")
     Chat("/tsw status")
     Chat("/tsw combatonly - ON in combat, hidden out of combat")
+    Chat("/tsw mhonly     - show main-hand bar only")
+    Chat("/tsw offhand    - toggle off-hand bar")
     Chat("/tsw teston     - force visible fake bars")
     Chat("/tsw testoff    - stop fake bars")
     Chat("/tsw test       - toggle fake bars")
@@ -455,15 +465,20 @@ function TSW:Slash(msg)
 
     if lower == "status" then
         local mh, oh = GetSpeeds()
+        local cleuMode = "old-vararg"
+        if CombatLogGetCurrentEventInfo then cleuMode = "new-function" end
+
         Chat("loaded. enabled=" .. tostring(db.enabled) ..
             " locked=" .. tostring(db.locked) ..
             " combat=" .. tostring(inCombat) ..
             " showOOC=" .. tostring(db.showOOC) ..
+            " showOH=" .. tostring(db.showOH) ..
             " test=" .. tostring(testMode) ..
             " x=" .. tostring(db.x) ..
             " y=" .. tostring(db.y) ..
             " MH=" .. tostring(mh) ..
             " OH=" .. tostring(oh) ..
+            " CLEU=" .. cleuMode ..
             " frameShown=" .. tostring(frame and frame:IsShown()))
         return
     end
@@ -475,6 +490,20 @@ function TSW:Slash(msg)
         SoftStart()
         SetVisible(ShouldShow())
         Chat("combat-only mode: ON. Visible in combat, hidden out of combat.")
+        return
+    end
+
+    if lower == "mhonly" then
+        db.showOH = false
+        if ohBar then ohBar:Hide() end
+        Chat("main-hand only mode: ON. Off-hand bar hidden.")
+        return
+    end
+
+    if lower == "offhand" or lower == "oh" then
+        db.showOH = not db.showOH
+        if not db.showOH and ohBar then ohBar:Hide() end
+        Chat("off-hand bar: " .. (db.showOH and "ON" or "OFF"))
         return
     end
 
@@ -628,22 +657,65 @@ function TSW:Slash(msg)
     PrintHelp()
 end
 
-local function HandleCombatLog()
-    if not CombatLogGetCurrentEventInfo or not playerGUID then return end
+local function FindOldCombatLogOffhandFlag(...)
+    -- Old 2.4.3 combat-log varargs usually put the offhand flag at/near the end.
+    -- Scan backward for the last boolean. That avoids depending on one exact private-server layout.
+    local n = select("#", ...)
+    local i
+    for i = n, 1, -1 do
+        local v = select(i, ...)
+        if type(v) == "boolean" then
+            return v
+        end
+    end
+    return false
+end
 
-    local _, subevent, _, sourceGUID = CombatLogGetCurrentEventInfo()
-    if sourceGUID ~= playerGUID then return end
-    if subevent ~= "SWING_DAMAGE" and subevent ~= "SWING_MISSED" then return end
+local function HandleCombatLog(...)
+    local subevent
+    local sourceIsPlayer = false
+    local isOffHand = false
+
+    if CombatLogGetCurrentEventInfo then
+        -- 2.5.3 / modern Classic style.
+        local _, ev, _, sourceGUID = CombatLogGetCurrentEventInfo()
+        subevent = ev
+
+        if sourceGUID and playerGUID and sourceGUID == playerGUID then
+            sourceIsPlayer = true
+        end
+
+        if not sourceIsPlayer then return end
+        if subevent ~= "SWING_DAMAGE" and subevent ~= "SWING_MISSED" then return end
+
+        if subevent == "SWING_DAMAGE" then
+            isOffHand = select(21, CombatLogGetCurrentEventInfo())
+        else
+            isOffHand = select(13, CombatLogGetCurrentEventInfo())
+        end
+    else
+        -- True 2.4.3 style: COMBAT_LOG_EVENT_UNFILTERED gives the values as ...
+        -- Common layouts:
+        --   timestamp, subevent, sourceGUID, sourceName, sourceFlags, destGUID...
+        --   timestamp, subevent, hideCaster, sourceGUID, sourceName, sourceFlags, destGUID...
+        local a3, a4, a5 = select(3, ...)
+        subevent = select(2, ...)
+
+        if subevent ~= "SWING_DAMAGE" and subevent ~= "SWING_MISSED" then return end
+
+        if playerGUID and (a3 == playerGUID or a4 == playerGUID) then
+            sourceIsPlayer = true
+        elseif playerName and (a4 == playerName or a5 == playerName) then
+            -- Fallback for odd/private 2.4.3 combat-log layouts.
+            sourceIsPlayer = true
+        end
+
+        if not sourceIsPlayer then return end
+        isOffHand = FindOldCombatLogOffhandFlag(...)
+    end
 
     local now = GetTime()
     local mh, oh = GetSpeeds()
-    local isOffHand
-
-    if subevent == "SWING_DAMAGE" then
-        isOffHand = select(21, CombatLogGetCurrentEventInfo())
-    else
-        isOffHand = select(13, CombatLogGetCurrentEventInfo())
-    end
 
     if isOffHand then
         if oh and now - lastOHSwing > 0.25 then
@@ -672,12 +744,13 @@ end
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         CopyDefaults()
-        playerGUID = UnitGUID("player")
+        if UnitGUID then playerGUID = UnitGUID("player") end
+        playerName = UnitName("player")
         CreateUI()
         SoftStart()
         CheckSpeedChange(true)
         SetVisible(ShouldShow())
-        Chat("loaded. Default ON, combat-only visibility. Type /tsw unlock to move.")
+        Chat("loaded. Default ON, combat-only, MH-only. Type /tsw offhand to show OH.")
         return
     end
 
@@ -709,16 +782,25 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
     end
 
     if event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        HandleCombatLog()
+        HandleCombatLog(...)
         return
     end
 
     if event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local unit, castGUID, spellID = ...
+        local unit, arg2, arg3 = ...
         if unit == "player" then
             local spellName
-            if spellID and GetSpellInfo then spellName = GetSpellInfo(spellID) end
-            if not spellName and castGUID and type(castGUID) == "string" then spellName = castGUID end
+
+            -- 2.5.3-style: unit, castGUID, spellID
+            if arg3 and type(arg3) == "number" and GetSpellInfo then
+                spellName = GetSpellInfo(arg3)
+            end
+
+            -- 2.4.3-style: unit, spellName, rank
+            if not spellName and arg2 and type(arg2) == "string" then
+                spellName = arg2
+            end
+
             ResetForSpell(spellName)
         end
         return
